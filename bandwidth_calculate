@@ -1,0 +1,659 @@
+#!/usr/bin/perl
+#################################################
+# Squid Arms and Tentacles: Bandwidth quotas (version 1.5)
+#
+#        Mike A. Leonetti
+#          2012-12-20
+# http://www.mikealeonetti.com/wiki/index.php?title=Squid_Arms_and_Tentacles:_Bandwidth_quotas
+#
+# Copyright (c) 2012 Mike A. Leonetti
+# All rights reserved.
+#
+# This package is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#################################################
+
+use strict;
+use DBI;
+#use Data::Dumper;
+use Pod::Usage;
+use Getopt::Std;
+use POSIX qw(mktime strftime);
+use Socket qw( inet_aton inet_ntoa );
+
+# Prototypes
+sub table_exists($);
+sub ip2long($);
+sub long2ip($);
+sub ips_in_range_query_string($$);
+
+########
+# Squid log path and filename
+########
+my $log_path = "/var/log/squid";
+my $log_file = "access.log";
+
+########
+# MySQL options
+########
+my $mysql_host = 'localhost';
+my $mysql_user = 'squidaccess';
+my $mysql_pass = 'squidaccess';
+my $mysql_db = 'squidaccess';
+
+########
+# Options to be excluded from the Squid access log
+########
+my @excludelist = (
+	{ "field" => 3, "pattern" => "TCP_DENIED/" } ,
+	{ "field" => 3, "pattern" => "NONE/" },
+	{ "field" => 6, "pattern" => '^http://127\.0\.0\.1/' } # localhost
+);
+
+########
+# Extra options
+########
+my $debug = 1; # Set to 1 to allow extra debug messages, 0 to turn them off.
+	
+## Load the config file
+# Pretty much taken almost exactly from Squish
+my %opts = ();
+getopts( '?', \%opts )
+	or pod2usage( -exitstatus => 1, -verbose => 0 );
+
+# Make sure we have a rules file passed to us
+pod2usage(-exitstatus => 0, -verbose => 2) if( $opts{'?'} );
+pod2usage( -exitstatus => 1, -verbose => 0 ) unless( $ARGV[0] );
+
+# Check to see if the file is already running somewhere else
+my $pid_file = "/tmp/bandwidth_calculate.run";
+
+# Examine pidfile
+if( -e $pid_file )
+{
+	open( PIDFILE, "<", $pid_file );
+	$_ = <PIDFILE>;
+	close( PIDFILE );
+
+	chomp;
+
+	if( $_ )
+	{
+		if( $_ and kill( 0, $_ ) )
+		{
+			print( STDERR "$0: Process is already running with ID $_\n" );
+			exit( 1 );
+		}
+	}
+}
+
+# Write the PID file to say we are in use
+open( PIDFILE, ">", $pid_file );
+print( PIDFILE $$ );
+close( PIDFILE );
+
+# Now get our rules file
+my $rulesfile = $ARGV[0];
+
+# Make sure the rules file is accessable
+unless( -r $rulesfile )
+{
+	print STDERR qq/$0: Cannot open rules file "$rulesfile".\n/;
+	exit( 1 );
+}
+
+my $conffile;
+if( !open( $conffile, '<', $rulesfile ) )
+{
+	print STDERR "$0: $rulesfile: $!\n";
+	exit( 1 );
+}
+
+# The ordered list of refs
+my @rules_array = ();
+my @rules_names = ();
+
+while( $_ = <$conffile> )
+{
+	my $line = $.;
+
+	s/(?<!\\)#.*//;
+	s/^\s+//;
+	s/\s+$//;
+
+	next if( m/^$/ );
+
+	# Split by unescaped spaces
+	my @line = split( /(?<!\\)\s+/ );
+	my $upat;
+	my $name = shift @line;
+	# Remove all escapes
+	$name =~ s/(?<!\\)\\//g;
+
+	next if( $name eq '' );
+
+	my $rules_hash = {};
+
+	# Keep a top to bottom list of the rules for running in order
+	push( @rules_array, $rules_hash );
+	push( @rules_names, $name );
+
+	for my $quota ( @line )
+	{
+		if( $quota =~ m/(\d+)(h|s|m|mb|kb|b|gb)\/(d|day|w|week|m|month|y|yr|year)/i )
+		{
+			my $n=$1;
+			my $unit=$2;
+			my $period=$3;
+			my $tperiod;
+
+			if( $period =~ m/^d/i ) { $tperiod='d'; }
+			elsif( $period =~ m/^w/i ) { $tperiod='w'; }
+			elsif( $period =~ m/^m/i ) { $tperiod='m'; }
+			elsif( $period =~ m/^y/i ) { $tperiod='y'; }
+			else{ $tperiod = 0; }
+
+			my $f=1;
+
+			if( $unit =~ m/^m$/ ) { $f = 60; }
+			elsif( $unit =~ m/^h$/i ) { $f = 3600; }
+			elsif( $unit =~ m/^b$/i ) { $f = 1; } # cool
+				elsif( $unit =~ m/^kb$/i ) { $f = 1024; }
+			elsif( $unit =~ m/^mb$/i ) { $f = 1024*1024; }
+			elsif( $unit =~ m/^gb$/i ) { $f = 1024*1024*1024; }
+
+			$rules_hash->{ $period } = $f*int( $n );
+		}
+		else
+		{
+			print STDERR "$0: rules:$line says \"$quota\" (user \"$name\")\n";
+		}
+	}
+}
+close( $conffile );
+
+# Connect to the table
+my $db_handle = DBI->connect( "dbi:mysql:$mysql_db;$mysql_host", $mysql_user, $mysql_pass )
+        or die $DBI::errstr;
+
+#my $time = mktime( 23, 23, 23,
+#			21,
+#			11,
+#			2012 );
+
+my @time_elements = localtime();
+my %current_time = ();
+$current_time{'week'} = int( strftime( "%V", @time_elements ) );
+$current_time{'month'} = int( strftime( "%m", @time_elements ) );
+$current_time{'year'} = int( strftime( "%Y", @time_elements ) );
+$current_time{'day'} = int( strftime( "%j", @time_elements ) );
+
+#printf( "Today: %s\nStart month: %s\nEnd month: %s\nStart week: %s\nEnd week: %s\n",
+#	strftime( "%D %T", localtime( $time ) ),
+#	strftime( "%D %T", localtime( $this_month_start ) ),
+#	strftime( "%D %T", localtime( $this_month_end ) ),
+#	strftime( "%D %T", localtime( $this_week_start ) ),
+#	strftime( "%D %T", localtime( $this_week_end ) ) );
+
+# Make sure there is a trailiing slash
+$log_path.="/" unless( $log_path=~m|/$| );
+
+# Keep track of if we updated and the latest date
+my $latest_date = 0;
+my $new_latest_date = 0;
+
+# Try to pull the latest date from the database
+my $sth = $db_handle->prepare( "SELECT `value` FROM `bandwidth_save` WHERE `option`='latest_date' LIMIT 0, 1;" );
+$sth->execute();
+my @result = $sth->fetchrow_array();
+
+# We have a result so add it
+if( defined($result[0]) )
+{
+	$latest_date = $result[0];
+	printf( "Latest date is %s\n", strftime( "%D %T", localtime( $latest_date ) ) )
+		if( $debug );
+}
+else
+{
+	printf( "Starting Latest date from scratch.\n" )
+		if( $debug );
+}
+
+$sth->finish();
+
+# Array to use for accumulating the bandwidth
+my $dates = {};
+
+# Get all logs in a directory
+opendir( my $directory, $log_path )
+	or die( "Could not open $log_path." );
+
+while( $_ = readdir( $directory ) )
+{
+	# Make sure it looks like our log file
+	next unless( $_=~/$log_file/ );
+
+	my $file = $log_path.$_;
+	my $mtime = (stat( $file ))[9];
+
+	# Make sure it's not older than what we want
+	if( $latest_date>=$mtime )
+	{
+		printf( "Skipping file: %s m %s\n", $file, strftime( "%D %T", localtime( $mtime ) ) )
+			if( $debug );
+		next;
+	}
+	else
+	{
+		printf( "Reading file: %s m %s\n", $file, strftime( "%D %T", localtime( $mtime ) ) )
+			if( $debug );
+	}
+
+	# Open up the file and take a look
+	my $loghandle;
+
+	# Check what handle is necessary
+	if( $file=~/\.gz$/ )
+	{
+		open( $loghandle, "-|", "zcat", $file );
+	}
+	elsif( $file=~/\.bz2$/ )
+	{
+		open( $loghandle, "-|", "bzcat", $file );
+	}
+	else
+	{
+		open( $loghandle, "<", $file );
+	}
+
+	LOGLOOP:
+	while( my $line = <$loghandle> )
+	{
+		# Trim
+		$line=~s/^\s*//;
+		$line=~s/\s*$//;
+
+		# Split
+		# 0=date 1=transfer-msec? 2=ipaddr 3=status/code 4=size 5=operation
+		# 6=url 7=user 8=method/connected-to... 9=content-type
+		# Get the parts
+		my @parts = split( / +/, $line );
+
+		# Set the right time and leave the millisecond
+		my $time = $parts[0];
+		#$time=~s/\.\d*//;
+		#$time = int( $time );
+
+		# Make sure we have only the lines we want
+		if( $latest_date and $latest_date>=$time )
+		{
+			printf( "Skipping line because date %s<%s latest date (%s)\n",
+				strftime( "%D %T", localtime( $time ) ),
+				strftime( "%D %T", localtime( $latest_date ) ),
+				$line )
+				if( $debug );
+			next;
+		}
+
+		foreach my $rule ( @excludelist )
+		{
+			if( $parts[ $rule->{'field'} ] =~ m#$rule->{'pattern'}# )
+			{
+				printf( "Skipped line '%s'\n", $line )
+					if( $debug );
+				next LOGLOOP;
+			}
+		}
+
+		my $ip = $parts[2];
+		my $user = $parts[7];
+
+		# Check if a user if really logged in
+		$user = '' if( $user eq '-' );
+
+		my %line_time = ();
+		my @line_time_elements = localtime( $time );
+		my $week = int( strftime( "%V", @line_time_elements ) );
+		my $month = int( strftime( "%m", @line_time_elements ) );
+		my $year = int( strftime( "%Y", @line_time_elements ) );
+		my $day = int( strftime( "%j", @line_time_elements ) );
+
+		# Get the size
+		my $size = int( $parts[4] );
+
+		# Skip if we have nothing to add
+		next unless( $size );
+
+		# Make sure the variables exist
+		$dates->{ $year } = { 'weeks'=>{}, 'months'=>{} } unless( defined( $dates->{ $year } ) );
+		$dates->{ $year }->{'weeks'}->{ $week } = {} unless( defined( $dates->{ $year }->{'weeks'}->{ $week } ) );
+		$dates->{ $year }->{'months'}->{ $month } = {} unless( defined( $dates->{ $year }->{'months'}->{ $month } ) );
+		$dates->{ $year }->{'years'}->{ 0 } = {} unless( defined( $dates->{ $year }->{'years'}->{ 0 } ) );
+		$dates->{ $year }->{'months'}->{ $month }->{ $ip } = 0 unless( defined( $dates->{ $year }->{'months'}->{ $month }->{ $ip } ) );
+		$dates->{ $year }->{'weeks'}->{ $week }->{ $ip } = 0 unless( defined( $dates->{ $year }->{'weeks'}->{ $week }->{ $ip } ) );
+
+		if( $user )
+		{
+			$dates->{ $year }->{'months'}->{ $month }->{ $user } = 0 unless( defined( $dates->{ $year }->{'months'}->{ $month }->{ $user } ) );
+			$dates->{ $year }->{'weeks'}->{ $week }->{ $user } = 0 unless( defined( $dates->{ $year }->{'weeks'}->{ $week }->{ $user } ) );
+			$dates->{ $year }->{'days'}->{ $day }->{ $user } = 0 unless( defined( $dates->{ $year }->{'days'}->{ $day }->{ $user } ) );
+			$dates->{ $year }->{'years'}->{ 0 }->{ $user } = 0 unless( defined( $dates->{ $year }->{'years'}->{ 0 }->{ $user } ) );
+
+			$dates->{ $year }->{'weeks'}->{ $week }->{ $user }+= $size;
+			$dates->{ $year }->{'months'}->{ $month }->{ $user }+= $size;
+			$dates->{ $year }->{'days'}->{ $day }->{ $user }+= $size;
+			$dates->{ $year }->{'years'}->{ 0 }->{ $user }+= $size;
+		}
+
+		$dates->{ $year }->{'months'}->{ $month }->{ $ip } = 0 unless( defined( $dates->{ $year }->{'months'}->{ $month }->{ $ip } ) );
+		$dates->{ $year }->{'weeks'}->{ $week }->{ $ip } = 0 unless( defined( $dates->{ $year }->{'weeks'}->{ $week }->{ $ip } ) );
+		$dates->{ $year }->{'days'}->{ $day }->{ $ip } = 0 unless( defined( $dates->{ $year }->{'days'}->{ $day }->{ $ip } ) );
+		$dates->{ $year }->{'years'}->{ 0 }->{ $ip } = 0 unless( defined( $dates->{ $year }->{'years'}->{ 0 }->{ $ip } ) );
+
+		$dates->{ $year }->{'months'}->{ $month }->{ $ip }+= $size;
+		$dates->{ $year }->{'weeks'}->{ $week }->{ $ip }+= $size;
+		$dates->{ $year }->{'days'}->{ $day }->{ $ip }+= $size;
+		$dates->{ $year }->{'years'}->{ 0 }->{ $ip }+= $size;
+
+		# Update the latest date to now
+		$new_latest_date = ( $time, $new_latest_date )[ $time < $new_latest_date ];
+	}
+
+	close( $loghandle );
+}
+
+closedir( $directory );
+
+# Check to see if we have updates to write
+if( $new_latest_date )
+{
+	my $query;
+
+	$query = <<EOF;
+INSERT INTO `bandwidth_usage` (`name`, `type`, `year`, `value2`, `bytes`)
+VALUES ('%s', '%s', '%s', '%s', %u)
+ON DUPLICATE KEY UPDATE `bytes`=`bytes`+%u;
+EOF
+
+	# First loop through the years
+	foreach my $year ( keys %$dates )
+	{
+		my $date = $dates->{$year};
+
+		# Now loop through the type either 'months' or 'weeks'
+		foreach my $type ( keys %$date )
+		{
+			my $type_string;
+
+			if( $type eq 'months' )
+			{
+				$type_string = 'm';
+			}
+			elsif( $type eq 'weeks' )
+			{
+				$type_string = 'w';
+			}
+			elsif( $type eq 'years' )
+			{
+				$type_string = 'y';
+			}
+			else
+			{
+				$type_string = 'd';
+			}
+
+			my $weeksmonths = $date->{$type};
+
+			foreach my $value2 ( %$weeksmonths )
+			{
+				my $names = $weeksmonths->{$value2};
+
+				# Now loop through the names/ips
+				foreach my $name ( keys %$names )
+				{
+					my $size = $names->{$name};
+
+					my $runme = sprintf( $query,
+						$name, $type_string, $year, $value2, $size, $size );
+
+					$db_handle->do( $runme );
+				}
+			}
+		}
+	}
+
+	$db_handle->do( qq/REPLACE INTO `bandwidth_save` (`option`, `value`) VALUES ('latest_date', '$new_latest_date');/ );
+
+}
+
+# Keep track of all of the names we are blocking
+my @block_names = ();
+
+# Now run our rules "engine"
+foreach my $i ( 0 .. $#rules_array )
+{
+	# String name (search string)
+	my $name = $rules_names[ $i ];
+	my $query_name;
+
+	# Rule hashref
+	my $rule = $rules_array[ $i ];
+
+	if( $name=~m|(^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$| )
+	{
+		my $subnet = ip2long( $1 );
+		my $mask = ip2long( $2 );
+
+		my $first_ip = inet_ntoa( pack( 'N', ( $subnet & $mask ) + 1 ) );
+		my $last_ip = inet_ntoa( pack( 'N', ( $subnet | ~$mask ) - 1 ) );
+
+		$query_name = '('.ips_in_range_query_string( $first_ip, $last_ip ).')';
+	}
+	elsif( $name=~m|(^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$| )
+	{
+		my $subnet = ip2long( $1 );
+		my $bits = $2;
+		my $mask = -1<<(32-$bits);
+
+		my $first_ip = inet_ntoa( pack( 'N', ( $subnet & $mask ) + 1 ) );
+		my $last_ip = inet_ntoa( pack( 'N', ( $subnet | ~$mask ) - 1 ) );
+
+		$query_name = '('.ips_in_range_query_string( $first_ip, $last_ip ).')';
+	}
+	elsif( $name=~m|(^\d{1,3}\.\d{1,3}\.\d{1,3}\.)(\d{1,3})-(\d{1,3})$| )
+	{
+		# Loop through all possible IPs
+
+		$query_name = '('.ips_in_range_query_string( $1.$2 , $1.$3 ).')';
+	}
+	elsif( $name=~m|^[\d\*]{1,3}\.[\d\*]{1,3}\.[\d\*]{1,3}\.[\d\*]{1,3}$| )
+	{
+		# Replace all * with % for mysql
+		my $query_safe_name = $name;
+		$query_safe_name=~s/\*/%/;
+
+		$query_name = qq/`name` LIKE '$query_safe_name'/;
+	}
+	else
+	{
+		$query_name = qq/`name`='$name'/;
+	}
+
+	next unless( length($query_name) );
+
+	#print "$name is $query_name\n";
+	#next;
+
+	my $query = <<EOF;
+SELECT SUM(`bytes`) AS total_bytes FROM `bandwidth_usage`
+WHERE %s AND `type`='%s' AND `year`=%u AND `value2`=%u
+GROUP BY `year` HAVING total_bytes>%u;
+EOF
+
+	# Get the queries for checking
+	foreach my $type ( keys %$rule )
+	{
+		my $year = $current_time{'year'};
+		my $value2;
+		my $bytes = int( $rule->{ $type } );
+
+		if( $type eq 'm' ) { $value2 = $current_time{'month'}; }
+		elsif( $type eq 'd' ) { $value2 = $current_time{'day'}; }
+		elsif( $type eq 'w' ) { $value2 = $current_time{'week'}; }
+		elsif( $type eq 'y' ) { $value2 = 0; }
+
+		my $runme = sprintf( $query,
+				$query_name,
+				$type,
+				$year,
+				$value2,
+				$bytes );
+
+		#print( "$runme\n" );
+
+
+		my $sth = $db_handle->prepare( $runme );
+		$sth->execute();
+		my @result = $sth->fetchrow_array();
+
+		#print "$name is $result[0]\n";
+
+		# We have a result so add it
+		if( defined($result[0]) )
+		{
+			push( @block_names, $name );
+		}
+
+		$sth->finish();
+	}
+}
+
+# Now do some table switching stuff
+# Drop the temp table if it exists
+$db_handle->do( "DROP TABLE IF EXISTS `bandwidth_blocks_temp`;" );
+$db_handle->do( "DROP TABLE IF EXISTS `bandwidth_blocks_old`;" );
+
+# Create the temp table
+my $query = <<EOF;
+CREATE TABLE IF NOT EXISTS `bandwidth_blocks_temp` (
+  `order` mediumint(5) unsigned NOT NULL,
+  `name` varchar(64) NOT NULL,
+  PRIMARY KEY (`order`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+EOF
+
+$db_handle->do( $query );
+
+if( @block_names )
+{
+	my $i = 0;
+	foreach my $name ( @block_names )
+	{
+		$db_handle->do( sprintf( "INSERT INTO `bandwidth_blocks_temp` (`order`, `name`) VALUES (%u, '%s');",
+				$i++, $name ) );
+	}
+}
+
+# Rename the old table if it exists
+if( table_exists( 'bandwidth_blocks' ) )
+{
+	$db_handle->do( "RENAME TABLE `bandwidth_blocks` TO `bandwidth_blocks_old`;" );
+}
+
+# Now make the real table
+$db_handle->do( "RENAME TABLE `bandwidth_blocks_temp` TO `bandwidth_blocks`;" );
+
+$db_handle->disconnect();
+
+# Get rid of our PID file
+unlink( $pid_file );
+
+exit( 0 );
+
+sub table_exists($)
+{
+        my $table = shift;
+        my $sth = $db_handle->prepare( "SELECT 1 FROM `$table`;" );
+        my $rv = $sth->execute();
+
+        return( 1 ) if( $rv );
+
+        return( 0 );
+}
+
+sub ips_in_range_query_string($$)
+{
+	my ( $ip_start, $ip_end ) = @_;
+
+	my $ip_start_long = ip2long( $ip_start );
+	my $ip_end_long = ip2long( $ip_end );
+
+	# Make sure the end IP is more than the start IP
+	return( '' ) unless( $ip_start_long<=$ip_end_long );
+
+	my $return_string = '';
+
+	# Loop through the IPs
+	foreach( $ip_start_long .. $ip_end_long )
+	{
+		my $ip = long2ip( $_ );
+
+		$return_string.= " OR " if( length($return_string) );
+		$return_string.= qq/`name`='$ip'/;
+	}
+
+	return( $return_string );
+}
+
+sub ip2long($)
+{
+	return( unpack( 'N', inet_aton(shift) ) );
+}
+sub long2ip($)
+{
+	return( inet_ntoa(pack('N', shift)) );
+}
+
+__END__
+
+=head1 NAME
+
+bandwidth_calculate - Calculates the bandwidth usage over a time period for each Squid user/IP address
+
+=head1 SYNOPSIS
+
+bandwidth_calculate [rulesfile]
+
+ Rulesfiles: Rules for user blocking
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<rulesfiles>
+
+This is a path to a file containing the rules on how to block users. The rules file is orderd so that there
+is a new rule on each line. Each line has in the first column the IP address or username to match for the rule
+and each remaining column contains the criteria for blocking. Columns are separated by whitespaces.
+
+Example:
+ # Make sure the user "mike" cannot use more than 100 MB a day or 1 GB a week
+ mike		100mb/d 1gb/w
+ # The 192.168.1.0/24 subnet cannot use more than a total of 50 GB a month
+ 192.168.1.0/24	50gb/m
+ # 10.0.0.150 should have limits too
+ 10.0.0.150	10mb/d
+
+Limits should be in the forms: X[unit]/[time] where:
+ - X is the bytes variable
+ - unit is the unit multiplier which can be either b (bytes), k/kb (kilobytes), m/mb (megabytes), g/gb (gigabytes)
+ - time is the time multiplier which can be eitehr d/day, w/week, m/month, y/year
+
+=back
+
+=head1 NOTE
+
+Please create the MySQL tables before running this script. This script keeps information in MySQL.
+
+=cut

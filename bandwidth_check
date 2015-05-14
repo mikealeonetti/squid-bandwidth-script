@@ -1,0 +1,217 @@
+#!/usr/bin/perl
+#################################################
+# Squid Arms and Tentacles: Bandwidth quotas (version 1.5)
+#
+#        Mike A. Leonetti
+#          2012-12-20
+# http://www.mikealeonetti.com/wiki/index.php?title=Squid_Arms_and_Tentacles:_Bandwidth_quotas
+#
+# Copyright (c) 2012 Mike A. Leonetti
+# All rights reserved.
+#
+# This package is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#################################################
+
+use strict;
+use DBI;
+use Pod::Usage;
+#use Data::Dumper;
+
+use Socket qw( inet_aton );
+use POSIX qw( strftime );
+
+use IO::Handle;
+
+# Prototypes
+sub ip2long($);
+sub in_subnet($$);
+
+## MySQL info
+my $mysql_host = 'localhost';
+my $mysql_user = 'squidaccess';
+my $mysql_pass = 'squidaccess';
+my $mysql_db = 'squidaccess';
+
+## Debug info
+# When set to 1 will output to /tmp/bandwidth_check.debug
+my $debug = 0;
+
+##
+# Some more vars
+##
+BEGIN{ $|=1 };
+
+##
+# Start
+##
+# Make sure we have a group
+#pod2usage( -exitstatus => 1, -verbose => 0 ) unless( $ARGV[0] );
+
+my $debugfile;
+open( $debugfile, ">>", "/tmp/bandwidth_check.debug" ) if( $debug );
+$debugfile->autoflush( 1 ) if( $debug );
+
+print( $debugfile "$$: File started at ".strftime( "%D %T", localtime() )."\n" ) if( $debug );
+
+while( <STDIN> )
+{
+	# Trim trim
+	s/^\s*//;
+	s/\s*$//;
+	
+	# Store it so we don't lose it
+	#$ip_address = $_;
+
+	#printf( $debugfile "%u %s: OK\n",
+	#	$$, strftime( "%D %T", localtime() ) ) if( $debug );
+	#print( "OK\n" );
+	#next;
+	
+	# Get the arguments even if they are wrapped in quotes
+	my @inputs = ();
+	push( @inputs, $+ ) while( /"([^"]+)"|(\S+)/g );
+
+	my $ip_address = $inputs[0];
+	my $username = $inputs[1];
+
+	printf( $debugfile "%u %s: Requested info for ip %s, username %s\n",
+			$$, strftime( "%D %T", localtime() ),
+			$ip_address, $username ) if( $debug );
+
+        #$current_time = time();
+	my $dbh = DBI->connect( "dbi:mysql:$mysql_db;$mysql_host", $mysql_user, $mysql_pass );
+
+	#$dbh->do( qq/DELETE FROM addresses WHERE `end_time`<$current_time;/ );
+	#$dbh->do( q/DELETE FROM `groups` WHERE NOT EXISTS (SELECT `user` FROM `addresses` WHERE `user`=`groups`.`user`);/ );
+
+        my $query_handle = $dbh->prepare( qq/SELECT `name` FROM `bandwidth_blocks` ORDER BY `order` ASC;/ );
+        $query_handle->execute();
+
+	my $found = 0;
+	my @result = ();
+	my @search_strings = ();
+
+	# Make sure the value exists first
+	push( @search_strings, $result[0] ) while( @result = $query_handle->fetchrow_array() );
+
+	# Is it an IP or a name?
+	foreach( @search_strings )
+	{
+		if( in_subnet( $ip_address, $_ ) )
+		{
+			$found = 1;
+			last;
+		}
+	}
+
+	if( !$found and $username and $username ne '-' )
+	{
+		foreach( @search_strings )
+		{
+			if( /^$username$/ )
+			{
+				$found = 1;
+				last;
+			}
+		}
+	}
+
+        if( $found )
+        {
+		print( "ERR\n" );
+		print( $debugfile "$$: ERR\n" ) if( $debug );
+        }
+        else
+	{
+		print( "OK\n" );
+		print( $debugfile "$$: OK\n" ) if( $debug );
+        }
+
+        $query_handle->finish();
+	$dbh->disconnect();
+}
+
+print( $debugfile "$$: File closed at ".strftime( "%D %T", localtime() )."\n" ) if( $debug );
+close( $debugfile ) if( $debug );
+
+exit( 0 );
+
+sub ip2long($)
+{
+	return( unpack( 'N', inet_aton(shift) ) );
+}
+
+sub in_subnet($$)
+{
+	my $ip = shift;
+	my $subnet = shift;
+
+	my $ip_long = ip2long( $ip );
+
+	if( $subnet=~m|(^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$| )
+	{
+		my $subnet = ip2long( $1 );
+		my $mask = ip2long( $2 );
+
+		if( ($ip_long & $mask)==$subnet )
+		{
+			return( 1 );
+		}
+	}
+	elsif( $subnet=~m|(^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$| )
+	{
+		my $subnet = ip2long( $1 );
+		my $bits = $2;
+		my $mask = -1<<(32-$bits);
+
+		$subnet&= $mask;
+
+		if( ($ip_long & $mask)==$subnet )
+		{
+			return( 1 );
+		}
+	}
+	elsif( $subnet=~m|(^\d{1,3}\.\d{1,3}\.\d{1,3}\.)(\d{1,3})-(\d{1,3})$| )
+	{
+		my $start_ip = ip2long( $1.$2 );
+		my $end_ip = ip2long( $1.$3 );
+
+		if( $start_ip<=$ip_long and $end_ip>=$ip_long )
+		{
+			return( 1 );
+		}
+	}
+	elsif( $subnet=~m|^[\d\*]{1,3}\.[\d\*]{1,3}\.[\d\*]{1,3}\.[\d\*]{1,3}$| )
+	{
+		my $search_string = $subnet;
+
+		$search_string=~s/\./\\\./g;
+		$search_string=~s/\*/\.\*/g;
+
+		if( $ip=~/^$search_string$/ )
+		{
+			return( 1 );
+		}
+	}
+
+	return( 0 );
+}
+
+__END__
+
+=head1 NAME
+
+bandwidth_check - Check to see if an IP address or username are exceeding the current bandwidth limit
+
+=head1 SYNOPSIS
+
+squidauth
+
+=back
+
+=head1 NOTE
+
+This script is designed to be called directly by Squid. Please only call this script manually in a testing scenario.
+
+=cut
