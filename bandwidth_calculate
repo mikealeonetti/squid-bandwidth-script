@@ -53,7 +53,7 @@ my @excludelist = (
 ########
 # Extra options
 ########
-my $debug = 1; # Set to 1 to allow extra debug messages, 0 to turn them off.
+my $debug = 0; # Set to 1 to allow extra debug messages, 0 to turn them off.
 	
 ## Load the config file
 # Pretty much taken almost exactly from Squish
